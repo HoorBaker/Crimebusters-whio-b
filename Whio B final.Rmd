@@ -1,0 +1,306 @@
+---
+title: "Whio B - Crime busters"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r,message = FALSE}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+```
+
+
+## Map 
+
+```{r}
+# Using police boundaries from 2021 as official boundaries for Auckland city police district have not changed till present
+library(sf)
+police_districts <- st_read("nz-police-district-boundaries-29-april-2021.gpkg")
+```
+
+```{r}
+# Resident Population per 250m for Auckland 
+pop_per_250m <- read.csv("new-zealand-estimated-resident-population-grid-250-metre.csv")
+head(pop_per_250m)
+
+# Convert dataframe to sf for spatial data, crs = 2193 for NZ
+pop_per_250m <- st_as_sf(pop_per_250m, coords = c("CENTROID_X", "CENTROID_Y"), crs = 2193)
+```
+
+
+```{r}
+# head(police_districts) shows that the police_districts of "Auckland City" exists 
+aklcity_boundary <- police_districts[police_districts$DISTRICT_N == "Auckland City",]
+#aklcity_boundary
+
+# matching coordinate systems using st_crs() and then transforming the aklcity_boundary to the same crs/coordinate system 
+aklcity_boundary  <- aklcity_boundary |> 
+  st_transform(st_crs(pop_per_250m))
+
+# filtering for the rows in the population dataset for the auckland city distict population
+aklcity_pop <- pop_per_250m |>
+  st_filter(aklcity_boundary)
+
+# sum all the columns named "PopEst2022", "PopEst2023", "PopEst2024", "PopEst2025" using colsum to add the populations for each year within the auckland_city district 
+
+colSums(st_drop_geometry(aklcity_pop)[c("PopEst2022", "PopEst2023", "PopEst2024", "PopEst2025")], na.rm = TRUE)
+```
+
+We found data on the police boundaries from 2021 and we selected the boundary for Auckland City.
+Using the estimated resident population per 250m for Auckland dataset (2022 to 2025), filter rows for coordinates that are in aklcity_boundary. Then sum the rows of the columns for each year to add all populations.
+
+
+
+
+
+# Making a map
+```{r}
+
+# Using police_districts dataset again for Auckland City boundary
+
+# regions used to ensure that correct SA2 areas for auckland region are selected
+regions <- st_read("regional-council-2025-clipped.gpkg")
+
+# SA2 areas in wide Auckland Region: selected by cropping NZ to a region of wider Auckland then downloading the SA2 dataset
+sa2 <- st_read("statistical-area-2-higher-geographies-2025.gpkg")
+
+auckland_region <- regions %>%
+  filter(REGC2025_V1_00_NAME == "Auckland")
+
+aklcity_boundary <- police_districts %>%
+  filter(DISTRICT_N == "Auckland City")
+
+# SA2 areas in Auckland City Police District: using st_point_on_surface() to count how many data points of sa2 lie on the Auckland region
+points <- st_point_on_surface(sa2)
+akl_sa2 <- sa2 %>%
+  filter(lengths(st_intersects(points,auckland_region)) > 0)
+
+# SA2 areas in Auckland City Police District: using st_point_on_surface() to count how many data points of sa2 lie on the Auckland city police district
+points2 <- st_point_on_surface(akl_sa2)
+aklcity_sa2 <- akl_sa2 %>%
+  filter(lengths(st_intersects(points2,aklcity_boundary)) > 0)
+```
+
+
+
+
+
+```{r}
+# Using ggplot:
+
+# st_union() to combine all SA2 areas and st_sf() to convert this to a dataframe
+aklcity_outline <- st_sf(geometry = st_union(aklcity_sa2))
+
+aklcity_map <- ggplot() +
+  # All SA2s areas of outer Auckland region in grey with white border
+  geom_sf(data = akl_sa2, fill = "grey", colour = "white", linewidth = 0.5) +
+
+  # Auckland city police district regional outline
+  geom_sf(data = aklcity_outline, fill = NA, colour = "black", linewidth = 0.2) +
+  
+  # Original data selection included the region being too large so longitude and latitude west, east, south, north were changed to crop the plot
+  coord_sf(
+    xlim = c(174.65, 174.90),
+    ylim = c(-36.95, -36.78),
+    # 4326 is the Geographic coordinate system to tell R that the ranges stand for longitude and latitude 
+    default_crs = st_crs(4326) ) +
+  labs(title = "Auckland City Police District", subtitle = "SA2 areas within the Auckland Region with Auckland City Police District boundary") +
+  theme_void()
+
+aklcity_map 
+```
+
+
+
+# Using meshcodes to turn them into wider SA2 regions for easier interpretation of larger areas such a suburb or part of a suburb
+
+### reading in data 
+```{r}
+# victim_tp contains victims as observations with the meshcode of area of crime 
+
+#victim_tp <- read.csv("victim_time_place.csv") ---- file wasnt encoded properly so read.csv didnt work at first 
+
+victim_tp <- read.delim(
+  "victim_time_place.csv",
+  fileEncoding = "UTF-16LE",
+  skip = 0
+)
+
+meshblocks <- st_read("meshblock-higher-geographies-2025.gpkg")
+names(victim_tp)
+names(meshblocks)
+```
+
+
+
+### turning meshcodes into sa2 regions
+```{r}
+victim_tp <- victim_tp |>
+  mutate(Year = year(my(Year.Month))) 
+victim_tp
+
+meshblock_df <- meshblocks |>
+  as.data.frame() |>
+  select(MB2025_V1_00, SA22025_V1_00) |>
+  rename(Meshblock = MB2025_V1_00, SA2 = SA22025_V1_00) |>
+  mutate(Meshblock = as.integer(Meshblock))
+meshblock_df
+
+victim_sa2 <- victim_tp |>
+  left_join(meshblock_df,by = "Meshblock")
+```
+
+
+
+```{r}
+victim_totals <- victim_sa2 |>
+  filter(!is.na(SA2), Year == 2023 |Year == 2024| Year == 2025) |>
+  group_by(SA2, Year) |>
+  summarise(victimisations = sum(Victimisations, na.rm = TRUE))
+
+victim_totals
+
+# Join dataset SA2 values to current map SA2 dataset
+aklcity_victims <- aklcity_sa2 |>
+  left_join(victim_totals, by = c("SA22025_V1_00" = "SA2")) |>
+  filter(!is.na(Year))
+```
+
+
+
+```{r}
+aklcity_map <- ggplot() +
+
+  # All surrounding SA2 areas in grey
+  geom_sf(
+    data = akl_sa2,
+    fill = "grey85",
+    colour = "white",
+    linewidth = 0.1
+  ) +
+
+  # Colour Auckland City SA2s by victimisations
+  geom_sf(
+    data = aklcity_victims,
+    aes(fill = victimisations),
+    colour = "white",
+    linewidth = 0.1
+  ) +
+
+  # Colour gradient
+  scale_fill_stepsn(colours = c("#fee8e1","#fcbba1","#fc9272","#fb6a4a","#ef3b2c","#cb181d","#a50f15","#800B10","#4A0008"),
+    breaks = c(100, 250, 400, 500, 700, 900, 1200, 1600),
+    na.value = "grey70") +
+  
+  facet_wrap(~Year, ncol = 3) +
+
+  # Crop 
+  coord_sf(
+    xlim = c(174.65, 174.90),
+    ylim = c(-36.95, -36.78),
+    default_crs = st_crs(4326)
+  ) +
+
+  labs(
+    title = "Victimisations in Auckland City Police District",
+    subtitle = "2023 to 2025",
+    fill = "Victimisation Count per SA2 region") +
+  theme_void()
+
+
+
+
+top3_2023 <- aklcity_victims |>
+  filter(Year == 2023) |>
+  slice_max(victimisations, n = 7)
+
+top3_2024 <- aklcity_victims |>
+  filter(Year == 2024) |>
+  slice_max(victimisations, n = 7)
+
+top3_2025 <- aklcity_victims |>
+  filter(Year == 2025) |>
+  slice_max(victimisations, n = 7)
+
+aklcity_map <- aklcity_map +
+  geom_sf_text(
+    data = top3_2023,
+    aes(label = SA22025_V1_00_NAME),
+    size = 2.2,
+    colour = "black",
+    check_overlap = TRUE
+  ) +
+  geom_sf_text(
+    data = top3_2024,
+    aes(label = SA22025_V1_00_NAME),
+    size = 2.2,
+    colour = "black",
+    check_overlap = TRUE
+  ) +
+  geom_sf_text(
+    data = top3_2025,
+    aes(label = SA22025_V1_00_NAME),
+    size = 2.2,
+    colour = "black",
+    check_overlap = TRUE
+  )
+aklcity_map
+
+ggsave(
+  "aklcity_map_2023-2025.png",
+  plot = aklcity_map,
+  width = 10,
+  height = 6,
+  dpi = 300,
+  bg = "white"
+)
+```
+
+## top 3 and top 5 suburb total count for 2023 - 2025
+```{r}
+
+top3_suburbs <- aklcity_victims |>
+  st_drop_geometry() |>
+  filter(Year %in% c(2023, 2024, 2025)) |>
+  group_by(Year, SA22025_V1_00_NAME) |>
+  summarise(total_victims = sum(victimisations), .groups = "drop") |>
+  group_by(Year) |>
+  arrange(desc(total_victims), .by_group = TRUE) |>
+  filter(row_number() <= 3)|>
+  rename("Suburb" = 2, "Total Victims"= 3)
+
+top3_suburbs
+
+
+top5_suburbs <- aklcity_victims |>
+  st_drop_geometry() |>
+  filter(Year %in% c(2023, 2024, 2025)) |>
+  group_by(Year, SA22025_V1_00_NAME) |>
+  summarise(total_victims = sum(victimisations), .groups = "drop") |>
+  group_by(Year) |>
+  arrange(desc(total_victims), .by_group = TRUE) |>
+  filter(row_number() <= 5)|>
+  rename("Suburb" = 2, "Total Victims"= 3)
+
+top5_suburbs
+
+```
+
+
+## proportion of suburbs with greater than 100 victimisations per suburb per year 
+```{r}
+prop_over100 <- aklcity_victims |>
+  st_drop_geometry() |>
+  filter(Year %in% c(2023, 2024, 2025)) |>
+  group_by(Year) |>
+  summarise(suburb_proportion = mean(victimisations > 100, na.rm = TRUE))
+
+prop_over100
+```
+
+
